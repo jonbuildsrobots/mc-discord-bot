@@ -3,6 +3,7 @@ use crate::{Packet, send_or_log};
 
 use std::io::BufRead;
 
+// TODO(Jon): Move this to async
 pub fn start_stdin_forwarding(sender: &mpsc::UnboundedSender<Packet>) {
     let sender = sender.clone();
     std::thread::spawn(move || {

@@ -1,0 +1,11 @@
+data get entity PLAYER Dimension
+PLAYER has the following entity data: "minecraft:overworld"
+
+data get entity PLAYER Pos
+PLAYER has the following entity data: [1, 2, 3]
+
+execute in minecraft:overworld run forceload query
+N force loaded chunks were found in minecraft:overworld at: [1, 2]
+// NOTE: These are chunk coords and need to be multiplied by 16
+
+No force loaded chunks wre found in minecraft:overworld
