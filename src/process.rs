@@ -1,82 +1,13 @@
-use tokio::sync::mpsc;
+use tokio::task;
+use tokio::{process::ChildStdin, sync::mpsc::UnboundedSender};
 use tokio::process::Command;
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use tokio::io::{self, AsyncReadExt};
 
-use crate::{Packet, send_or_log};
+use crate::{Event, send_or_log};
 
-// This parses the label and content out of a log line assuming that the line is formatted as follows:
-// [__:__:__] [src] [label]: content
-pub fn parse_line(line: &str) -> Result<(&str, &str), &'static str> {
-    if line.len() < 13 {
-        return Err("too short");
-    }
-    
-    // ensure line is formatted as such
-    // [__:__:__] [
-    let line_bytes = line.as_bytes();
-    if (line_bytes[0]  != b'[') ||
-       (line_bytes[3]  != b':') ||
-       (line_bytes[6]  != b':') ||
-       (line_bytes[9]  != b']') ||
-       (line_bytes[10] != b' ') ||
-       (line_bytes[11] != b'[')
-    {
-        return Err("invalid format");
-    }
-
-    // Label starts 3 bytes after the `src` segment's ']' byte
-    let label_start = line_bytes[12..].iter().position(|x| *x == b']').ok_or("invalid format, no src segment found")? + 15;
-
-    // Ensure label_start is within the line's length 
-    if line_bytes.len() <= label_start {
-        return Err("error finding label start");
-    }
-
-    // Find label end
-    let label_end = line_bytes[label_start..].iter().position(|x| *x == b']').ok_or("error finding label end")? + label_start;
-
-    // Ensure label_end is within the line's length 
-    if line_bytes.len() <= label_end {
-        return Err("error finding label end");
-    }
-
-    // Content starts 3 bytes after the label's end
-    let content_start = label_end + 3;
-
-    // ensure content_start is within the line's length 
-    if line_bytes.len() <= content_start {
-        return Err("invalid content");
-    }
-
-    let label = match std::str::from_utf8(&line_bytes[label_start..label_end]) {
-        Ok(v) => v,
-        Err(_) => return Err("label not utf8"),
-    };
-
-    let content = match std::str::from_utf8(&line_bytes[content_start..]) {
-        Ok(v) => v,
-        Err(_) => return Err("content not utf8"),
-    };
-
-    return Ok((label, content));
-}
-
-fn process_line(line: &str, sender: &mpsc::UnboundedSender<Packet>) {
-    let (label, content) = match parse_line(line) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("{} {}", e, line);
-            return;
-        },
-    };
-
-    send_or_log(sender, Packet::LogLine(label.to_string(), content.to_string()));
-    println!("Processed [{}] {}", label, content);
-}
-
-fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdio: T, sender: mpsc::UnboundedSender<Packet>) {
-    tokio::task::spawn(async move {
+fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdio: T, sender: UnboundedSender<Event>) {
+    task::spawn(async move {
         let mut used: usize = 0;
         let mut buffer: [u8; 1000] = [0; 1000];
         loop {
@@ -108,9 +39,17 @@ fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdi
                             continue;
                         },
                     };
-
-                    process_line(line, &sender);
+                    
+                    // Print line & advance line_start
+                    println!("{line}");
                     line_start = i + 1;
+                    
+                    // Remove non-ascii characters & send cleaned line as an avent
+                    let cleaned_line: String = line
+                        .chars()
+                        .filter(|c| c.is_ascii())
+                        .collect();
+                    send_or_log(&sender, Event::StdinLine(cleaned_line));
                 }
             }
 
@@ -125,19 +64,17 @@ fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdi
     });
 }
 
-pub async fn start_process_wrapper(server_command: &str, server_command_args: &[String], sender: &mpsc::UnboundedSender<Packet>) {
-    let mut cmd = Command::new(server_command);
-    cmd.args(server_command_args);
-
-    cmd.stdout(Stdio::piped());
-    cmd.stdin(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
+pub async fn start_process_wrapper(
+    sender: UnboundedSender<Event>,
+) -> Result<ChildStdin, io::Error> {
     println!("Spawning child process");
-    let mut child = cmd.spawn().expect("failed to spawn command");
+    let mut child = Command::new("./run.sh")
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
     
     let stdin = child.stdin.take().expect("child did not have a handle to stdin");
-    send_or_log(sender, Packet::ProcessStarted(stdin));
     
     let stdout = child.stdout.take().expect("child did not have a handle to stdout");
     spawn_line_processing_task(stdout, sender.clone());
@@ -145,25 +82,11 @@ pub async fn start_process_wrapper(server_command: &str, server_command_args: &[
     let stderr = child.stderr.take().expect("child did not have a handle to stderr");
     spawn_line_processing_task(stderr, sender.clone());
 
-    let exit_status = child.wait().await;
-    println!("process exited {:?}", exit_status);
+    task::spawn(async move {
+        let exit_status = child.wait().await;
+        println!("process exited {:?}", exit_status);
+        send_or_log(&sender, Event::ProcessStopped);
+    });
 
-    send_or_log(sender, Packet::StopServer());
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::process::parse_line;
-
-    #[test]
-    fn test_parse_line() {
-        assert_eq!(parse_line("[__:__:__] [A] [TEST1]: content").unwrap(), ("TEST1", "content"));
-        assert_eq!(parse_line("[__:__:__] [B] [TEST2]: A").unwrap(), ("TEST2", "A"));
-        assert_eq!(parse_line("[__:__:__] [] [TEST2]: A").unwrap(), ("TEST2", "A"));
-        assert_eq!(parse_line("[__:__:__] [] [TEST3]: ").unwrap_err(), "invalid content");
-        assert_eq!(parse_line("[__:__:__] [] [").unwrap_err(), "error finding label start");
-        assert_eq!(parse_line("[__:__:__] [] [abcdefg").unwrap_err(), "error finding label end");
-        assert_eq!(parse_line("[__:__:__] ").unwrap_err(), "too short");
-        assert_eq!(parse_line("A__:__:__] [] [").unwrap_err(), "invalid format");
-    }
+    Ok(stdin)
 }
