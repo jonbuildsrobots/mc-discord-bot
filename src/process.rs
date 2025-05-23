@@ -10,23 +10,29 @@ fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdi
     task::spawn(async move {
         let mut used: usize = 0;
         let mut buffer: [u8; 1000] = [0; 1000];
-        loop {
-            // drop data if buffer fills without any lines
+        'outer: loop {
+            // Drop data if buffer fills without any lines
             if used == buffer.len() {
                 println!("Buffer filled, dropping data");
                 used = 0;
             }
 
-            // read from 
+            // Read from the stream
             let bytes_read = match stdio.read(&mut buffer[used..]).await {
                 Ok(v) => v,
-                Err(_) => break,
+                Err(e) => {
+                    println!("Stdio read error: {e}");
+                    break;
+                },
             };
+
+            // Stream has been closed, break
+            if bytes_read == 0 { break; }
 
             let old_used = used;
             used += bytes_read;
 
-            // process completed lines
+            // Process completed lines
             let mut line_start: usize = 0;
             for i in old_used..used {
                 if buffer[i] == ('\n' as u8) {
@@ -35,8 +41,8 @@ fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdi
                     let line = match std::str::from_utf8(&buffer[line_start..line_end]) {
                         Ok(v) => v,
                         Err(e) => {
-                            println!("Error: {}", e);
-                            continue;
+                            println!("Stdio to utf8 error: {e}");
+                            break 'outer;
                         },
                     };
                     
@@ -53,7 +59,7 @@ fn spawn_line_processing_task<T: AsyncReadExt + Unpin + Send + 'static>(mut stdi
                 }
             }
 
-            // shift buffer downwards to remove processed data
+            // Shift buffer downwards to remove processed data
             used -= line_start;
             for i in 0..used {
                 buffer[i] = buffer[i + line_start];
